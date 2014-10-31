@@ -17,6 +17,10 @@ ifneq ($(CEPH_RBD),)
 MODULES += bs_rbd.so
 endif
 
+ifneq ($(CEPH_RBD_AIO),)
+MODULES += bs_rbd_aio.so
+endif
+
 ifneq ($(GLFS_BD),)
 MODULES += bs_glfs.so
 endif
@@ -99,6 +103,9 @@ tgtimg: $(TGTIMG_OBJS)
 
 bs_rbd.so: bs_rbd.c
 	$(CC) -shared $(CFLAGS) bs_rbd.c -o bs_rbd.so -lrados -lrbd
+
+bs_rbd_aio.so: bs_rbd_aio.c
+	$(CC) -shared $(CFLAGS) bs_rbd_aio.c -o bs_rbd_aio.so -lrados -lrbd
 
 bs_glfs.so: bs_glfs.c
 	$(CC) -I/usr/include/glusterfs/api -shared $(CFLAGS) bs_glfs.c -o bs_glfs.so -lgfapi
