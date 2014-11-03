@@ -76,17 +76,16 @@ static void parse_imagepath(char *path, char **pool, char **image, char **snap)
 #define AIO_MAX_IODEPTH    128
 
 struct rbd_iocb {
+	rbd_completion_t completion;
 	struct scsi_cmd *data;
 	uint16_t rbd_aio_opcode;	/* see IOCB_CMD_ above */
-  char *rbd_aio_buf;
-  uint64_t rbd_aio_nbytes;
-  int64_t	rbd_aio_offset;
-  int rbd_aio_evt_fd;
-  
-  int io_complete;
-  int result;
-  unsigned int *io_evts_cnt;
-  rbd_completion_t completion;
+	char *rbd_aio_buf;
+	uint64_t rbd_aio_nbytes;
+	int64_t	rbd_aio_offset;
+	int rbd_aio_evt_fd;
+	
+	int io_complete;
+	int result;
 };
 
 struct bs_rbd_aio_info {
@@ -101,10 +100,6 @@ struct bs_rbd_aio_info {
 
 	struct scsi_lu *lu;
 	int evt_fd;
-
-	struct rbd_iocb iocb_arr[AIO_MAX_IODEPTH];
-	struct rbd_iocb *piocb_arr[AIO_MAX_IODEPTH];
-	unsigned int io_evts_cnt;
 	
 	char *poolname;
 	char *imagename;
@@ -128,49 +123,6 @@ static inline struct bs_rbd_aio_info *RBDP(struct scsi_lu *lu)
 /* bs_rbd_aio_info is allocated just after the bs_thread_info */
 //#define RBDP(lu)	((struct bs_rbd_aio_info *) ((char *)lu +  sizeof(struct scsi_lu) + sizeof(struct bs_thread_info)))
 
-static void bs_rbd_aio_iocb_prep(struct bs_rbd_aio_info *info, int idx,
-			     struct scsi_cmd *cmd)
-{
-	struct rbd_iocb *rbd_iocb = &info->iocb_arr[idx];
-	unsigned int scsi_op = (unsigned int)cmd->scb[0];
-
-	rbd_iocb->data = cmd;
-
-	switch (scsi_op) {
-	case WRITE_6:
-	case WRITE_10:
-	case WRITE_12:
-	case WRITE_16:
-		rbd_iocb->rbd_aio_opcode = IO_CMD_PWRITE;
-		rbd_iocb->rbd_aio_buf = scsi_get_out_buffer(cmd);
-		rbd_iocb->rbd_aio_nbytes = scsi_get_out_length(cmd);
-
-		dprintf("prep WR cmd:%p op:%x buf:0x%p sz:%lx\n",
-			cmd, scsi_op, rbd_iocb->rbd_aio_buf, rbd_iocb->rbd_aio_nbytes);
-		break;
-
-	case READ_6:
-	case READ_10:
-	case READ_12:
-	case READ_16:
-		rbd_iocb->rbd_aio_opcode = IO_CMD_PREAD;
-		rbd_iocb->rbd_aio_buf = scsi_get_in_buffer(cmd);
-		rbd_iocb->rbd_aio_nbytes = scsi_get_in_length(cmd);
-
-		dprintf("prep RD cmd:%p op:%x buf:0x%p sz:%lx\n",
-			cmd, scsi_op, rbd_iocb->rbd_aio_buf, rbd_iocb->rbd_aio_nbytes);
-		break;
-
-	default:
-		return;
-	}
-
-	rbd_iocb->rbd_aio_offset = cmd->offset;
-	rbd_iocb->rbd_aio_evt_fd = info->evt_fd;
-	rbd_iocb->io_complete = 0;
-	rbd_iocb->result = 0;
-}
-
 static void bs_rbd_finish_aiocb(rbd_completion_t comp, void *data)
 {
 	struct rbd_iocb *rbd_iocb = data;
@@ -178,15 +130,20 @@ static void bs_rbd_finish_aiocb(rbd_completion_t comp, void *data)
 	rbd_iocb->io_complete = 1;
 	rbd_iocb->result = rbd_aio_get_return_value(rbd_iocb->completion);
 	uint64_t evts_complete = 1;
-  write(rbd_iocb->rbd_aio_evt_fd, &evts_complete, sizeof(evts_complete));
-  rbd_aio_release(rbd_iocb->completion);
+	write(rbd_iocb->rbd_aio_evt_fd, &evts_complete, sizeof(evts_complete));
+	rbd_aio_release(rbd_iocb->completion);
+	
+	struct scsi_cmd *cmd = (void *)(unsigned long)rbd_iocb->data;
+	dprintf("cmd: %p\n", cmd);
+	target_cmd_io_done(cmd, SAM_STAT_GOOD);
+	
+	free(&rbd_iocb->completion);
 }
 
 static int bs_rbd_aio_submit_dev_batch(struct bs_rbd_aio_info *info)
 {
-	int nsubmit = 0, nsuccess = 0;
+	int nsubmit = 0, nsuccess = 0, i = 0;
 	struct scsi_cmd *cmd, *next;
-	int i = 0;
 
 	nsubmit = info->iodepth - info->npending; /* max allowed to submit */
 	if (nsubmit > info->nwaiting)
@@ -200,45 +157,81 @@ static int bs_rbd_aio_submit_dev_batch(struct bs_rbd_aio_info *info)
 		return 0;
 
 	list_for_each_entry_safe(cmd, next, &info->cmd_wait_list, bs_list) {
-		bs_rbd_aio_iocb_prep(info, i, cmd);
-		list_del(&cmd->bs_list);
-		if (++i == nsubmit)
-			break;
-	}
+		//bs_rbd_aio_iocb_prep(info, cmd);
+		struct rbd_iocb *rbd_iocb = malloc(sizeof(*rbd_iocb));
+		unsigned int scsi_op = (unsigned int)cmd->scb[0];
 	
-	int r = -1,j = 0;
-	for( j = 0; j < i; j++)
-	{
-	  r = rbd_aio_create_completion(info->piocb_arr[j], bs_rbd_finish_aiocb,
-	  					&(info->iocb_arr[j].completion));
-	  if (r < 0) {
-	  	eprintf("rbd_aio_write failed.\n");
-	  	goto failed;
-	  }
-    if (info->iocb_arr[j].rbd_aio_opcode == IO_CMD_PWRITE) {
-	  	r = rbd_aio_write(info->rbd_image, info->iocb_arr[j].rbd_aio_offset,
-	  			  info->iocb_arr[j].rbd_aio_nbytes, info->iocb_arr[j].rbd_aio_buf,
-	  			  info->iocb_arr[j].completion);
-	  	if (r < 0) {
-	  		eprintf("rbd_aio_write failed.\n");
-	  		goto failed;
-	  	}
-    
-	  } else if (info->iocb_arr[j].rbd_aio_opcode == IO_CMD_PREAD) {
-	  	r = rbd_aio_read(info->rbd_image, info->iocb_arr[j].rbd_aio_offset,
-	  			  info->iocb_arr[j].rbd_aio_nbytes, info->iocb_arr[j].rbd_aio_buf,
-	  			  info->iocb_arr[j].completion);
-    
-	  	if (r < 0) {
-	  		eprintf("rbd_aio_read failed.\n");
-	  		goto failed;
-	  	}
-	  }
-	  
-	  nsuccess++;
-	  
-	  failed:
-	  	continue;
+		rbd_iocb->data = cmd;
+	
+		switch (scsi_op) {
+		case WRITE_6:
+		case WRITE_10:
+		case WRITE_12:
+		case WRITE_16:
+			rbd_iocb->rbd_aio_opcode = IO_CMD_PWRITE;
+			rbd_iocb->rbd_aio_buf = scsi_get_out_buffer(cmd);
+			rbd_iocb->rbd_aio_nbytes = scsi_get_out_length(cmd);
+	
+			dprintf("prep WR cmd:%p op:%x buf:0x%p sz:%lx\n",
+				cmd, scsi_op, rbd_iocb->rbd_aio_buf, rbd_iocb->rbd_aio_nbytes);
+			break;
+	
+		case READ_6:
+		case READ_10:
+		case READ_12:
+		case READ_16:
+			rbd_iocb->rbd_aio_opcode = IO_CMD_PREAD;
+			rbd_iocb->rbd_aio_buf = scsi_get_in_buffer(cmd);
+			rbd_iocb->rbd_aio_nbytes = scsi_get_in_length(cmd);
+	
+			dprintf("prep RD cmd:%p op:%x buf:0x%p sz:%lx\n",
+				cmd, scsi_op, rbd_iocb->rbd_aio_buf, rbd_iocb->rbd_aio_nbytes);
+			break;
+	
+		default:
+			break;
+		}
+	
+		rbd_iocb->rbd_aio_offset = cmd->offset;
+		rbd_iocb->rbd_aio_evt_fd = info->evt_fd;
+		rbd_iocb->io_complete = 0;
+		rbd_iocb->result = 0;
+		list_del(&cmd->bs_list);
+		
+		//rbd aio call
+		int r = rbd_aio_create_completion(rbd_iocb, bs_rbd_finish_aiocb,
+						&(rbd_iocb->completion));
+		if (r < 0) {
+			eprintf("rbd_aio_write failed.\n");
+			goto failed;
+		}
+    	if (rbd_iocb->rbd_aio_opcode == IO_CMD_PWRITE) {
+		  	r = rbd_aio_write(info->rbd_image, rbd_iocb->rbd_aio_offset,
+		  			  rbd_iocb->rbd_aio_nbytes, rbd_iocb->rbd_aio_buf,
+		  			  rbd_iocb->completion);
+		  	if (r < 0) {
+		  		eprintf("rbd_aio_write failed.\n");
+		  		goto failed;
+		  	}
+    	
+		} else if (rbd_iocb->rbd_aio_opcode == IO_CMD_PREAD) {
+			r = rbd_aio_read(info->rbd_image, rbd_iocb->rbd_aio_offset,
+					  rbd_iocb->rbd_aio_nbytes, rbd_iocb->rbd_aio_buf,
+					  rbd_iocb->completion);
+			
+			if (r < 0) {
+				eprintf("rbd_aio_read failed.\n");
+				goto failed;
+			}
+		}
+		
+		nsuccess++;
+		
+		failed:
+			continue;
+		
+		if (nsuccess == nsubmit)
+			break;
 	}
 	
 	if (unlikely(nsuccess < 0)) {
@@ -333,29 +326,14 @@ static int bs_rbd_aio_cmd_submit(struct scsi_cmd *cmd)
 	return 0;
 }
 
-static void bs_rbd_aio_complete_one(struct rbd_iocb *ep)
-{
-	struct scsi_cmd *cmd = (void *)(unsigned long)ep->data;
-	int result;
-	
-	if (likely(ep->result == 0))
-		result = SAM_STAT_GOOD;
-	else {
-		sense_data_build(cmd, MEDIUM_ERROR, 0);
-		result = SAM_STAT_CHECK_CONDITION;
-	}
-	dprintf("cmd: %p\n", cmd);
-	target_cmd_io_done(cmd, result);
-}
-
 static void bs_rbd_aio_get_completions(int fd, int events, void *data)
 {
 	struct bs_rbd_aio_info *info = data;
-	int i, ret;
+	int ret;
 	/* read from eventfd returns 8-byte int, fails with the error EINVAL
 	   if the size of the supplied buffer is less than 8 bytes */
 	uint64_t evts_complete;
-	unsigned int ncomplete, nevents;
+	unsigned int ncomplete;
 
 retry_read:
 	ret = read(info->evt_fd, &evts_complete, sizeof(evts_complete));
@@ -367,34 +345,8 @@ retry_read:
 		return;
 	}
 	ncomplete = (unsigned int) evts_complete;
-
-	while (ncomplete) {
-		nevents = min_t(unsigned int, ncomplete, ARRAY_SIZE(info->iocb_arr));
-retry_getevts:
-		//ret = io_getevents(info->ctx, 1, nevents, info->io_evts, NULL);
-		for (i = 0, ret = 0; i < AIO_MAX_IODEPTH; i++)
-		{
-			if(info->iocb_arr[i].io_complete == 1)
-				ret++;
-		}
-		
-		if (likely(ret > 0)) {
-			nevents = ret;
-			info->npending -= nevents;
-		} else {
-			if (ret == -EINTR)
-				goto retry_getevts;
-			eprintf("io_getevents failed, err:%d\n", -ret);
-			return;
-		}
-		dprintf("got %d ioevents out of %d, pending %d\n",
-			nevents, ncomplete, info->npending);
-
-		for (i = 0; i < nevents; i++)
-			bs_rbd_aio_complete_one(info->piocb_arr[i]);
-		ncomplete -= nevents;
-	}
-
+	info->npending -= ncomplete;
+	
 	if (info->nwaiting) {
 		dprintf("submit waiting cmds to tgt:%d lun:%"PRId64 "\n",
 			info->lu->tgt->tid, info->lu->lun);
@@ -534,11 +486,6 @@ static tgtadm_err bs_rbd_aio_init(struct scsi_lu *lu, char *bsopts)
 	INIT_LIST_HEAD(&info->dev_list_entry);
 	INIT_LIST_HEAD(&info->cmd_wait_list);
 	info->lu = lu;
-
-	for (i=0; i < ARRAY_SIZE(info->iocb_arr); i++){
-		info->piocb_arr[i] = &info->iocb_arr[i];
-		info->iocb_arr[i].io_evts_cnt = &info->io_evts_cnt;
-	}
 
 	tgtadm_err ret = TGTADM_UNKNOWN_ERR;
 	int rados_ret;
