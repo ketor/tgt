@@ -83,7 +83,6 @@ struct rbd_iocb {
 	uint64_t rbd_aio_nbytes;
 	int64_t	rbd_aio_offset;
 	
-	int io_complete;
 	int io_result;
 	struct bs_rbd_aio_info *rbd_info;
 };
@@ -99,7 +98,6 @@ struct bs_rbd_aio_info {
 	int resubmit;
 
 	struct scsi_lu *lu;
-	int evt_fd;
 	
 	char *poolname;
 	char *imagename;
@@ -120,17 +118,12 @@ static inline struct bs_rbd_aio_info *RBDP(struct scsi_lu *lu)
 {
 	return (struct bs_rbd_aio_info *) ((char *)lu + sizeof(*lu));
 }
-/* bs_rbd_aio_info is allocated just after the bs_thread_info */
-//#define RBDP(lu)	((struct bs_rbd_aio_info *) ((char *)lu +  sizeof(struct scsi_lu) + sizeof(struct bs_thread_info)))
 
 static void bs_rbd_finish_aiocb(rbd_completion_t comp, void *data)
 {
 	struct rbd_iocb *rbd_iocb = data;
 	
-	rbd_iocb->io_complete = 1;
 	rbd_iocb->io_result = rbd_aio_get_return_value(rbd_iocb->completion);
-	uint64_t evts_complete = 1;
-	//write(rbd_iocb->rbd_info->evt_fd, &evts_complete, sizeof(evts_complete));
 	rbd_aio_release(rbd_iocb->completion);
 	
 	struct scsi_cmd *cmd = (void *)(unsigned long)rbd_iocb->data;
@@ -140,148 +133,6 @@ static void bs_rbd_finish_aiocb(rbd_completion_t comp, void *data)
 	rbd_iocb->rbd_info->npending--;
 	
 	free(&rbd_iocb->completion);
-}
-
-static int bs_rbd_aio_submit_dev_batch(struct bs_rbd_aio_info *info)
-{
-	int nsubmit = 0, nsuccess = 0;
-	struct scsi_cmd *cmd, *next;
-
-	nsubmit = info->iodepth - info->npending; /* max allowed to submit */
-	if (nsubmit > info->nwaiting)
-		nsubmit = info->nwaiting;
-
-	dprintf("nsubmit:%d waiting:%d pending:%d, tgt:%d lun:%"PRId64 "\n",
-		nsubmit, info->nwaiting, info->npending,
-		info->lu->tgt->tid, info->lu->lun);
-
-	if (!nsubmit)
-		return 0;
-
-	list_for_each_entry_safe(cmd, next, &info->cmd_wait_list, bs_list) {
-		//bs_rbd_aio_iocb_prep(info, cmd);
-		struct rbd_iocb *rbd_iocb = malloc(sizeof(*rbd_iocb));
-		unsigned int scsi_op = (unsigned int)cmd->scb[0];
-	
-		rbd_iocb->data = cmd;
-	
-		switch (scsi_op) {
-		case WRITE_6:
-		case WRITE_10:
-		case WRITE_12:
-		case WRITE_16:
-			rbd_iocb->rbd_aio_opcode = IO_CMD_PWRITE;
-			rbd_iocb->rbd_aio_buf = scsi_get_out_buffer(cmd);
-			rbd_iocb->rbd_aio_nbytes = scsi_get_out_length(cmd);
-	
-			dprintf("prep WR cmd:%p op:%x buf:0x%p sz:%lx\n",
-				cmd, scsi_op, rbd_iocb->rbd_aio_buf, rbd_iocb->rbd_aio_nbytes);
-			break;
-	
-		case READ_6:
-		case READ_10:
-		case READ_12:
-		case READ_16:
-			rbd_iocb->rbd_aio_opcode = IO_CMD_PREAD;
-			rbd_iocb->rbd_aio_buf = scsi_get_in_buffer(cmd);
-			rbd_iocb->rbd_aio_nbytes = scsi_get_in_length(cmd);
-	
-			dprintf("prep RD cmd:%p op:%x buf:0x%p sz:%lx\n",
-				cmd, scsi_op, rbd_iocb->rbd_aio_buf, rbd_iocb->rbd_aio_nbytes);
-			break;
-	
-		default:
-			break;
-		}
-	
-		rbd_iocb->rbd_aio_offset = cmd->offset;
-		rbd_iocb->rbd_info = info;
-		rbd_iocb->io_complete = 0;
-		rbd_iocb->io_result = 0;
-		list_del(&cmd->bs_list);
-		
-		//rbd aio call
-		int r = rbd_aio_create_completion(rbd_iocb, bs_rbd_finish_aiocb,
-						&(rbd_iocb->completion));
-		if (r < 0) {
-			eprintf("rbd_aio_write failed.\n");
-			goto failed;
-		}
-    	if (rbd_iocb->rbd_aio_opcode == IO_CMD_PWRITE) {
-		  	r = rbd_aio_write(info->rbd_image, rbd_iocb->rbd_aio_offset,
-		  			  rbd_iocb->rbd_aio_nbytes, rbd_iocb->rbd_aio_buf,
-		  			  rbd_iocb->completion);
-		  	if (r < 0) {
-		  		eprintf("rbd_aio_write failed.\n");
-		  		goto failed;
-		  	}
-    	
-		} else if (rbd_iocb->rbd_aio_opcode == IO_CMD_PREAD) {
-			r = rbd_aio_read(info->rbd_image, rbd_iocb->rbd_aio_offset,
-					  rbd_iocb->rbd_aio_nbytes, rbd_iocb->rbd_aio_buf,
-					  rbd_iocb->completion);
-			
-			if (r < 0) {
-				eprintf("rbd_aio_read failed.\n");
-				goto failed;
-			}
-		}
-		
-		nsuccess++;
-		
-		failed:
-			continue;
-		
-		if (nsuccess == nsubmit)
-			break;
-	}
-	
-	if (unlikely(nsuccess < 0)) {
-		if (nsuccess == -EAGAIN) {
-			eprintf("delayed submit %d cmds to tgt:%d lun:%"PRId64 "\n",
-				nsubmit, info->lu->tgt->tid, info->lu->lun);
-			nsuccess = 0; /* leave the dev pending with all cmds */
-		}
-		else {
-			eprintf("failed to submit %d cmds to tgt:%d lun:%"PRId64
-				", err: %d\n",
-				nsubmit, info->lu->tgt->tid,
-				info->lu->lun, -nsuccess);
-			return nsuccess;
-		}
-	}
-	//if (unlikely(nsuccess < nsubmit)) {
-	//	for (i=nsubmit-1; i >= nsuccess; i--) {
-	//		cmd = info->iocb_arr[i].data;
-	//		list_add(&cmd->bs_list, &info->cmd_wait_list);
-	//	}
-	//}
-
-	info->npending += nsuccess;
-	info->nwaiting -= nsuccess;
-	/* if no cmds remain, remove the dev from the pending list */
-	if (likely(!info->nwaiting))
-			list_del(&info->dev_list_entry);
-
-	dprintf("submitted %d of %d cmds to tgt:%d lun:%"PRId64
-		", waiting:%d pending:%d\n",
-		nsuccess, nsubmit, info->lu->tgt->tid, info->lu->lun,
-		info->nwaiting, info->npending);
-	return 0;
-}
-
-static int bs_rbd_aio_submit_all_devs(void)
-{
-	struct bs_rbd_aio_info *dev_info, *next_dev;
-	int err;
-
-	/* pass over all devices having some queued cmds and submit */
-	list_for_each_entry_safe(dev_info, next_dev, &bs_aio_dev_list, dev_list_entry) {
-		err = bs_rbd_aio_submit_dev_batch(dev_info);
-		if (unlikely(err))
-			return err;
-	}
-	return 0;
 }
 
 static int bs_rbd_aio_cmd_submit(struct scsi_cmd *cmd)
@@ -312,53 +163,84 @@ static int bs_rbd_aio_cmd_submit(struct scsi_cmd *cmd)
 		dprintf("skipped cmd:%p op:%x\n", cmd, scsi_op);
 		return 0;
 	}
-
-	list_add_tail(&cmd->bs_list, &info->cmd_wait_list);
-	if (!info->nwaiting)
-		list_add_tail(&info->dev_list_entry, &bs_aio_dev_list);
-	info->nwaiting++;
-	set_cmd_async(cmd);
-
-	if (!cmd_not_last(cmd)) /* last cmd in batch */
-		return bs_rbd_aio_submit_all_devs();
-
-	if (info->nwaiting == info->iodepth - info->npending)
-		return bs_rbd_aio_submit_dev_batch(info);
-
-	return 0;
-}
-
-static void bs_rbd_aio_get_completions(int fd, int events, void *data)
-{
-	struct bs_rbd_aio_info *info = data;
-	int ret;
-	/* read from eventfd returns 8-byte int, fails with the error EINVAL
-	   if the size of the supplied buffer is less than 8 bytes */
-	uint64_t evts_complete;
 	
-retry_read:
-	ret = read(info->evt_fd, &evts_complete, sizeof(evts_complete));
-	if (unlikely(ret < 0)) {
-		eprintf("failed to read AIO completions, %m\n");
-		if (errno == EAGAIN || errno == EINTR)
-			goto retry_read;
+	//send submit now
+	set_cmd_async(cmd);
+	struct rbd_iocb *rbd_iocb = malloc(sizeof(*rbd_iocb));
 
-		return;
+	rbd_iocb->data = cmd;
+
+	switch (scsi_op) {
+	case WRITE_6:
+	case WRITE_10:
+	case WRITE_12:
+	case WRITE_16:
+		rbd_iocb->rbd_aio_opcode = IO_CMD_PWRITE;
+		rbd_iocb->rbd_aio_buf = scsi_get_out_buffer(cmd);
+		rbd_iocb->rbd_aio_nbytes = scsi_get_out_length(cmd);
+
+		dprintf("prep WR cmd:%p op:%x buf:0x%p sz:%lx\n",
+			cmd, scsi_op, rbd_iocb->rbd_aio_buf, rbd_iocb->rbd_aio_nbytes);
+		break;
+
+	case READ_6:
+	case READ_10:
+	case READ_12:
+	case READ_16:
+		rbd_iocb->rbd_aio_opcode = IO_CMD_PREAD;
+		rbd_iocb->rbd_aio_buf = scsi_get_in_buffer(cmd);
+		rbd_iocb->rbd_aio_nbytes = scsi_get_in_length(cmd);
+
+		dprintf("prep RD cmd:%p op:%x buf:0x%p sz:%lx\n",
+			cmd, scsi_op, rbd_iocb->rbd_aio_buf, rbd_iocb->rbd_aio_nbytes);
+		break;
+
+	default:
+		break;
+	}
+
+	rbd_iocb->rbd_aio_offset = cmd->offset;
+	rbd_iocb->rbd_info = info;
+	rbd_iocb->io_result = 0;
+	
+	//rbd aio call
+	int r = rbd_aio_create_completion(rbd_iocb, bs_rbd_finish_aiocb,
+					&(rbd_iocb->completion));
+	if (r < 0) {
+		eprintf("rbd_aio_write failed.\n");
+		goto failed;
+	}
+	if (rbd_iocb->rbd_aio_opcode == IO_CMD_PWRITE) {
+	  	r = rbd_aio_write(info->rbd_image, rbd_iocb->rbd_aio_offset,
+	  			  rbd_iocb->rbd_aio_nbytes, rbd_iocb->rbd_aio_buf,
+	  			  rbd_iocb->completion);
+	  	if (r < 0) {
+	  		eprintf("rbd_aio_write failed.\n");
+	  		goto failed;
+	  	}
+	
+	} else if (rbd_iocb->rbd_aio_opcode == IO_CMD_PREAD) {
+		r = rbd_aio_read(info->rbd_image, rbd_iocb->rbd_aio_offset,
+				  rbd_iocb->rbd_aio_nbytes, rbd_iocb->rbd_aio_buf,
+				  rbd_iocb->completion);
+		
+		if (r < 0) {
+			eprintf("rbd_aio_read failed.\n");
+			goto failed;
+		}
 	}
 	
-	//info->npending -= evts_complete;
+	info->npending++;
+	return 0;
 	
-	//if (info->nwaiting) {
-	//	dprintf("submit waiting cmds to tgt:%d lun:%"PRId64 "\n",
-	//		info->lu->tgt->tid, info->lu->lun);
-	//	bs_rbd_aio_submit_dev_batch(info);
-	//}
+	failed:
+		return 0;
 }
 
 static int bs_rbd_aio_open(struct scsi_lu *lu, char *path, int *fd, uint64_t *size)
 {
 	struct bs_rbd_aio_info *info = BS_RBD_AIO_I(lu);
-	int ret, afd;
+	int ret;
 	uint32_t blksize = 0;
 
 	info->iodepth = AIO_MAX_IODEPTH;
@@ -401,27 +283,7 @@ static int bs_rbd_aio_open(struct scsi_lu *lu, char *path, int *fd, uint64_t *si
 	if (!lu->attrs.no_auto_lbppbe)
 		update_lbppbe(lu, blksize);
 
-	afd = eventfd(0, O_NONBLOCK);
-	if (afd < 0) {
-		eprintf("failed to create eventfd for tgt:%d lun:%"PRId64 ", %m\n",
-			info->lu->tgt->tid, info->lu->lun);
-		ret = afd;
-		goto close_ctx;
-	}
-	dprintf("eventfd:%d for tgt:%d lun:%"PRId64 "\n",
-		afd, info->lu->tgt->tid, info->lu->lun);
-
-	//ret = tgt_event_add(afd, EPOLLIN, bs_rbd_aio_get_completions, info);
-	if (ret)
-		goto close_eventfd;
-	info->evt_fd = afd;
-
 	return 0;
-
-close_eventfd:
-	close(afd);
-close_ctx:
-	return ret;
 }
 
 static void bs_rbd_aio_close(struct scsi_lu *lu)
@@ -624,7 +486,6 @@ static tgtadm_err bs_rbd_aio_init(struct scsi_lu *lu, char *bsopts)
 		eprintf("bs_rbd_init: rados_connect: %d\n", rados_ret);
 		goto fail;
 	}
-	//ret = bs_thread_open(info, bs_rbd_request, nr_iothreads);
 fail:
 	if (confname)
 		free(confname);
@@ -634,8 +495,6 @@ fail:
 		free(virsecretuuid);
 	if (given_cephx_key)
 		free(given_cephx_key);
-
-	//return ret;
 	
 	return TGTADM_SUCCESS;
 }
@@ -643,12 +502,10 @@ fail:
 static void bs_rbd_aio_exit(struct scsi_lu *lu)
 {
 	struct bs_rbd_aio_info *rbd = RBDP(lu);
-
-	close(rbd->evt_fd);
 	rados_shutdown(rbd->cluster);
 }
 
-static struct backingstore_template aio_bst = {
+static struct backingstore_template rbd_aio_bst = {
 	.bs_name            = "rbd_aio",
 	.bs_datasize        = sizeof(struct bs_rbd_aio_info),
 	.bs_init            = bs_rbd_aio_init,
@@ -660,5 +517,5 @@ static struct backingstore_template aio_bst = {
 
 __attribute__((constructor)) static void register_bs_module(void)
 {
-	register_backingstore_template(&aio_bst);
+	register_backingstore_template(&rbd_aio_bst);
 }
