@@ -33,6 +33,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/eventfd.h>
+#include <pthread.h>
 
 #include "list.h"
 #include "util.h"
@@ -98,7 +99,15 @@ struct bs_rbd_aio_info {
 	int resubmit;
 
 	struct scsi_lu *lu;
+
+	int exit_flag;
+	pthread_mutex_t waitlist_lock;
+	pthread_cond_t  waitlist_cond;
+	pthread_mutex_t callback_lock;
+	pthread_cond_t  callback_cond;
 	
+	pthread_t submit_thread[AIO_MAX_IODEPTH];
+
 	char *poolname;
 	char *imagename;
 	char *snapname;
@@ -107,7 +116,7 @@ struct bs_rbd_aio_info {
 	rbd_image_t rbd_image;
 };
 
-static struct list_head bs_aio_dev_list = LIST_HEAD_INIT(bs_aio_dev_list);
+static struct list_head bs_rbd_aio_dev_list = LIST_HEAD_INIT(bs_rbd_aio_dev_list);
 
 static inline struct bs_rbd_aio_info *BS_RBD_AIO_I(struct scsi_lu *lu)
 {
@@ -123,14 +132,17 @@ static void bs_rbd_finish_aiocb(rbd_completion_t comp, void *data)
 {
 	struct rbd_iocb *rbd_iocb = data;
 	
-	rbd_iocb->io_result = rbd_aio_get_return_value(rbd_iocb->completion);
+	//rbd_iocb->io_result = rbd_aio_get_return_value(rbd_iocb->completion);
 	rbd_aio_release(rbd_iocb->completion);
 	
 	struct scsi_cmd *cmd = (void *)(unsigned long)rbd_iocb->data;
 	dprintf("cmd: %p\n", cmd);
 	target_cmd_io_done(cmd, SAM_STAT_GOOD);
 	
+	//pthread_mutex_lock(&rbd_iocb->rbd_info->callback_lock);
 	rbd_iocb->rbd_info->npending--;
+	//pthread_cond_signal(&rbd_iocb->rbd_info->callback_cond);
+	//pthread_mutex_unlock(&rbd_iocb->rbd_info->callback_lock);
 	
 	free(&rbd_iocb->completion);
 }
@@ -164,77 +176,148 @@ static int bs_rbd_aio_cmd_submit(struct scsi_cmd *cmd)
 		return 0;
 	}
 	
-	//send submit now
+	while(info->nwaiting == info->iodepth){
+		printf("waiting [wait:%d][iodepth:%d]\n", info->nwaiting, info->iodepth);
+	}
+	
+	//printf("nwaiting++ [wait:%d][iodepth:%d]\n", info->nwaiting, info->iodepth);
+	pthread_mutex_lock(&info->waitlist_lock);
+	list_add_tail(&cmd->bs_list, &info->cmd_wait_list);
+	info->nwaiting++;
 	set_cmd_async(cmd);
-	struct rbd_iocb *rbd_iocb = malloc(sizeof(*rbd_iocb));
-
-	rbd_iocb->data = cmd;
-
-	switch (scsi_op) {
-	case WRITE_6:
-	case WRITE_10:
-	case WRITE_12:
-	case WRITE_16:
-		rbd_iocb->rbd_aio_opcode = IO_CMD_PWRITE;
-		rbd_iocb->rbd_aio_buf = scsi_get_out_buffer(cmd);
-		rbd_iocb->rbd_aio_nbytes = scsi_get_out_length(cmd);
-
-		dprintf("prep WR cmd:%p op:%x buf:0x%p sz:%lx\n",
-			cmd, scsi_op, rbd_iocb->rbd_aio_buf, rbd_iocb->rbd_aio_nbytes);
-		break;
-
-	case READ_6:
-	case READ_10:
-	case READ_12:
-	case READ_16:
-		rbd_iocb->rbd_aio_opcode = IO_CMD_PREAD;
-		rbd_iocb->rbd_aio_buf = scsi_get_in_buffer(cmd);
-		rbd_iocb->rbd_aio_nbytes = scsi_get_in_length(cmd);
-
-		dprintf("prep RD cmd:%p op:%x buf:0x%p sz:%lx\n",
-			cmd, scsi_op, rbd_iocb->rbd_aio_buf, rbd_iocb->rbd_aio_nbytes);
-		break;
-
-	default:
-		break;
-	}
-
-	rbd_iocb->rbd_aio_offset = cmd->offset;
-	rbd_iocb->rbd_info = info;
-	rbd_iocb->io_result = 0;
+	pthread_cond_signal(&info->waitlist_cond);
+	pthread_mutex_unlock(&info->waitlist_lock);
+	//printf("nwaiting++ OK [wait:%d][iodepth:%d]\n", info->nwaiting, info->iodepth);
 	
-	//rbd aio call
-	int r = rbd_aio_create_completion(rbd_iocb, bs_rbd_finish_aiocb,
-					&(rbd_iocb->completion));
-	if (r < 0) {
-		eprintf("rbd_aio_write failed.\n");
-		goto failed;
-	}
-	if (rbd_iocb->rbd_aio_opcode == IO_CMD_PWRITE) {
-	  	r = rbd_aio_write(info->rbd_image, rbd_iocb->rbd_aio_offset,
-	  			  rbd_iocb->rbd_aio_nbytes, rbd_iocb->rbd_aio_buf,
-	  			  rbd_iocb->completion);
-	  	if (r < 0) {
-	  		eprintf("rbd_aio_write failed.\n");
-	  		goto failed;
-	  	}
+	return 0;
+}
+
+static void *submit_thread_fn(void *arg){
+	struct bs_rbd_aio_info *info = (struct bs_rbd_aio_info*)arg;
+	struct scsi_cmd *cmd;
+	unsigned int scsi_op;
+	struct rbd_iocb *rbd_iocb;
 	
-	} else if (rbd_iocb->rbd_aio_opcode == IO_CMD_PREAD) {
-		r = rbd_aio_read(info->rbd_image, rbd_iocb->rbd_aio_offset,
-				  rbd_iocb->rbd_aio_nbytes, rbd_iocb->rbd_aio_buf,
-				  rbd_iocb->completion);
+	while(info->exit_flag == 0){
+		//checkout cmd from bs_list
+		pthread_mutex_lock(&info->waitlist_lock);
+		if(info->nwaiting == 0){
+			//pthread_cond_wait(&info->waitlist_cond, &info->waitlist_lock);
+			
+			//if(info->nwaiting == 0){
+				//printf("000cond from wait [%d]\n", info->nwaiting);
+				pthread_mutex_unlock(&info->waitlist_lock);
+				continue;
+			//}
+		}
 		
+		if (!list_empty(&info->cmd_wait_list)) {
+			cmd = list_entry(info->cmd_wait_list.prev, struct scsi_cmd,
+					bs_list);
+			//printf("get cmd %p\n", cmd);
+		}else{
+			printf("11111no cmd continue\n");
+			pthread_mutex_unlock(&info->waitlist_lock);
+			continue;
+		}
+		
+		list_del(&cmd->bs_list);
+		info->nwaiting--;
+		//if(info->nwaiting > 0) pthread_cond_signal(&info->waitlist_cond);
+		pthread_mutex_unlock(&info->waitlist_lock);
+		//checkout cmd from bs_list end
+		
+		//printf("start do npending++ now\n");
+		
+		//do submit pending++
+		//pthread_mutex_lock(&info->callback_lock);
+		while(info->iodepth == info->npending){
+			//printf("pthread_cond_wait npending++ now\n");
+		//	pthread_cond_wait(&info->callback_cond, &info->callback_lock);
+			usleep(1);
+		}
+		info->npending++;
+		//printf("npending++ OK\n");
+		//pthread_mutex_unlock(&info->callback_lock);
+		//do submit pending++ end
+		
+		//printf("start do real submit now\n");
+		
+		//do real submit
+		rbd_iocb = malloc(sizeof(*rbd_iocb));
+		scsi_op = (unsigned int)cmd->scb[0];
+		rbd_iocb->data = cmd;
+		rbd_iocb->rbd_aio_offset = cmd->offset;
+		rbd_iocb->rbd_info = info;
+		rbd_iocb->io_result = 0;
+		
+		switch (scsi_op) {
+			case WRITE_6:
+			case WRITE_10:
+			case WRITE_12:
+			case WRITE_16:
+				rbd_iocb->rbd_aio_opcode = IO_CMD_PWRITE;
+				rbd_iocb->rbd_aio_buf = scsi_get_out_buffer(cmd);
+				rbd_iocb->rbd_aio_nbytes = scsi_get_out_length(cmd);
+		
+				dprintf("prep WR cmd:%p op:%x buf:0x%p sz:%lx\n",
+					cmd, scsi_op, rbd_iocb->rbd_aio_buf, rbd_iocb->rbd_aio_nbytes);
+				break;
+		
+			case READ_6:
+			case READ_10:
+			case READ_12:
+			case READ_16:
+				rbd_iocb->rbd_aio_opcode = IO_CMD_PREAD;
+				rbd_iocb->rbd_aio_buf = scsi_get_in_buffer(cmd);
+				rbd_iocb->rbd_aio_nbytes = scsi_get_in_length(cmd);
+		
+				dprintf("prep RD cmd:%p op:%x buf:0x%p sz:%lx\n",
+					cmd, scsi_op, rbd_iocb->rbd_aio_buf, rbd_iocb->rbd_aio_nbytes);
+				break;
+		
+			default:
+				break;
+		}
+		
+		int r = rbd_aio_create_completion(rbd_iocb, bs_rbd_finish_aiocb,
+						&(rbd_iocb->completion));
 		if (r < 0) {
-			eprintf("rbd_aio_read failed.\n");
+			eprintf("rbd_aio_write failed.\n");
+			printf("rbd_aio_write failed.\n");
 			goto failed;
 		}
+		if (rbd_iocb->rbd_aio_opcode == IO_CMD_PWRITE) {
+		  	r = rbd_aio_write(info->rbd_image, rbd_iocb->rbd_aio_offset,
+		  			  rbd_iocb->rbd_aio_nbytes, rbd_iocb->rbd_aio_buf,
+		  			  rbd_iocb->completion);
+		  	if (r < 0) {
+		  		eprintf("rbd_aio_write failed.\n");
+		  		printf("rbd_aio_write failed.\n");
+		  		goto failed;
+		  	}
+		
+		} else if (rbd_iocb->rbd_aio_opcode == IO_CMD_PREAD) {
+			r = rbd_aio_read(info->rbd_image, rbd_iocb->rbd_aio_offset,
+					  rbd_iocb->rbd_aio_nbytes, rbd_iocb->rbd_aio_buf,
+					  rbd_iocb->completion);
+			
+			if (r < 0) {
+				eprintf("rbd_aio_read failed.\n");
+				printf("rbd_aio_read failed.\n");
+				goto failed;
+			}
+		}
+		//printf("start do submit OK\n");
+		continue;
+		
+		failed:
+			continue;
+		//do real submit end
+		
+		
 	}
-	
-	info->npending++;
-	return 0;
-	
-	failed:
-		return 0;
+	return NULL;
 }
 
 static int bs_rbd_aio_open(struct scsi_lu *lu, char *path, int *fd, uint64_t *size)
@@ -244,6 +327,7 @@ static int bs_rbd_aio_open(struct scsi_lu *lu, char *path, int *fd, uint64_t *si
 	uint32_t blksize = 0;
 
 	info->iodepth = AIO_MAX_IODEPTH;
+	info->exit_flag = 0;
 	
 	rbd_image_info_t inf;
 	char *poolname;
@@ -276,6 +360,20 @@ static int bs_rbd_aio_open(struct scsi_lu *lu, char *path, int *fd, uint64_t *si
 	}
 	*size = inf.size;
 	blksize = inf.obj_size;
+
+	pthread_mutex_init(&info->callback_lock, NULL);
+	pthread_mutex_init(&info->waitlist_lock, NULL);
+	pthread_cond_init(&info->callback_cond, NULL);
+	pthread_cond_init(&info->waitlist_cond, NULL);
+	
+	int i = 0;
+	for(i = 0; i < 2; i++)
+	{
+		ret = pthread_create(&info->submit_thread[i], NULL, submit_thread_fn, (void*)info);
+		if (ret) {
+			return  ret;
+		}
+	}
 
 	eprintf("%s opened successfully for tgt:%d lun:%"PRId64 "\n",
 		path, info->lu->tgt->tid, info->lu->lun);
@@ -502,6 +600,19 @@ fail:
 static void bs_rbd_aio_exit(struct scsi_lu *lu)
 {
 	struct bs_rbd_aio_info *rbd = RBDP(lu);
+	rbd->exit_flag = 1;
+	
+	int i = 0;
+	for( i = 0 ;i < 2; i++ )
+	{
+		pthread_join(rbd->submit_thread[i], NULL);
+	}
+	
+	pthread_cond_destroy(&rbd->callback_cond);
+	pthread_cond_destroy(&rbd->waitlist_cond);
+	pthread_mutex_destroy(&rbd->callback_lock);
+	pthread_mutex_destroy(&rbd->waitlist_lock);
+	
 	rados_shutdown(rbd->cluster);
 }
 
@@ -515,7 +626,7 @@ static struct backingstore_template rbd_aio_bst = {
 	.bs_cmd_submit  	= bs_rbd_aio_cmd_submit,
 };
 
-__attribute__((constructor)) static void register_bs_module(void)
+void register_bs_module(void)
 {
 	register_backingstore_template(&rbd_aio_bst);
 }
