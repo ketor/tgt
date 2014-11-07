@@ -197,6 +197,9 @@ static void *submit_thread_fn(void *arg){
 	struct scsi_cmd *cmd;
 	unsigned int scsi_op;
 	struct rbd_iocb *rbd_iocb;
+	sigset_t set;
+	sigfillset(&set);
+	sigprocmask(SIG_BLOCK, &set, NULL);
 	
 	while(info->exit_flag == 0){
 		//checkout cmd from bs_list
@@ -367,7 +370,7 @@ static int bs_rbd_aio_open(struct scsi_lu *lu, char *path, int *fd, uint64_t *si
 	pthread_cond_init(&info->waitlist_cond, NULL);
 	
 	int i = 0;
-	for(i = 0; i < 2; i++)
+	for(i = 0; i < 16; i++)
 	{
 		ret = pthread_create(&info->submit_thread[i], NULL, submit_thread_fn, (void*)info);
 		if (ret) {
@@ -603,7 +606,7 @@ static void bs_rbd_aio_exit(struct scsi_lu *lu)
 	rbd->exit_flag = 1;
 	
 	int i = 0;
-	for( i = 0 ;i < 2; i++ )
+	for( i = 0 ;i < 16; i++ )
 	{
 		pthread_join(rbd->submit_thread[i], NULL);
 	}
